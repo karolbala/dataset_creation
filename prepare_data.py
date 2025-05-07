@@ -10,10 +10,15 @@ import rasterio
 from rasterio.features import rasterize
 import numpy as np
 import contextily as cx
+import datetime
+import openeo
+from openeo.processes import process
+import os
 
 
 
 
+# print("las")
 class OSMFetcher:
     def __init__(self, bbox_wgs):
         self.url="https://overpass-api.de/api/interpreter"
@@ -49,7 +54,7 @@ class DataProcessor:
         """
         self.osm_data = osm_data
         self.allowed = ["motorway", "trunk", "primary", "secondary", "tertiary"]
-        self._roads_gdf = None  # GeoDataFrame to be created and mutated in-place
+        self._roads_gdf = None
         self._stop_flag=False
     def _form_gdf(self):
         """
@@ -85,11 +90,11 @@ class DataProcessor:
                 lanes = 1
 
             if highway in ["motorway", "trunk"]:
-                return 8 * lanes
+                return 10 * lanes
             elif highway in ["primary", "secondary", "tertiary"]:
-                return 6 * lanes
+                return 8 * lanes
             else:
-                return 5 * lanes
+                return 7 * lanes
 
         # buffering can happen only on geometries in meter based CRS
         self._roads_gdf = self._roads_gdf.to_crs(epsg=3857)
@@ -153,10 +158,11 @@ class CoordsTransformer:
     
 
 class Rasterizer:
-    def __init__(self, bbox_2180, gdf, res=10):
+    def __init__(self, bbox_2180, gdf, counter, res=10):
         self.bounds = bbox_2180 
         self.res=res
         self.gdf=gdf
+        self.counter=counter
         self.raster=None
 
     def to_raster(self):
@@ -172,6 +178,25 @@ class Rasterizer:
             fill=0, 
             dtype='uint8')
         
+      
+        profile = {
+            'driver': 'GTiff',
+            'height': height,
+            'width': width,
+            'count': 1,
+            'dtype': 'uint8',
+            'crs': self.gdf.crs,  # or EPSG:3857 depending on your gdf CRS
+            'transform': transform,
+            'compress': 'lzw',
+            'nodata': 0
+        }
+
+        with rasterio.open(f'dataset/masks/mask{self.counter}.tiff', 'w', **profile) as dst:
+            dst.write(self.raster, 1)
+
+
+
+
         
     def viz(self):
         if self.raster is None:
@@ -183,6 +208,20 @@ class Rasterizer:
   
 
 
+class SentinelFetcher:
+    def __init__(self, bbox_wgs, counter):
+        self.bbox_wgs=bbox_wgs
+        self.date = datetime.date.today().strftime('%Y-%m-%d')
+        self.counter=counter
+    def establish_connection(self):
+        self.connection = openeo.connect("https://openeo.dataspace.copernicus.eu")
+        self.connection.authenticate_oidc()
+    def form_query(self):
+        self.cube = self.connection.load_collection(collection_id = "SENTINEL2_L2A", spatial_extent = {"west": self.bbox_wgs[1], "east": self.bbox_wgs[3], "south": self.bbox_wgs[0], "north": self.bbox_wgs[2]}, temporal_extent = ["2025-01-01", self.date], bands=["B04", "B03", "B02"], max_cloud_cover=5,)
+        self.cube = self.cube.reduce_dimension(dimension="t", reducer="min")
+        savere1 = self.cube.save_result(format = "GTiff")
+        savere1.download(f"dataset/images/ready{self.counter}.tiff")
+     
 
 
 
@@ -194,6 +233,14 @@ class GenerateSamples:
         self.viz=viz
         self._osm_data = None
         self._roads_gdf = None
+        self.create_dirs()
+
+    @staticmethod
+    def create_dirs():
+        if not os.path.isdir('dataset'):
+            os.mkdir("dataset")
+            os.mkdir("dataset/images")
+            os.mkdir("dataset/masks")
 
     def _get_random_coords(self):
         bounds = {
@@ -223,13 +270,14 @@ class GenerateSamples:
             processor = DataProcessor(osm_data)
             gdf = processor.roads_gdf
             stop_flag = processor._stop_flag
-
+            sen_fetcher=SentinelFetcher(transformer.wgs_coords, count)
             if not stop_flag and gdf is not None and not gdf.empty:
                 if self.viz:
                     roads_2180 = gdf.to_crs(epsg=2180)
-                    rasterizer = Rasterizer(bbox_2180, roads_2180)
+                    rasterizer = Rasterizer(bbox_2180, roads_2180, count)
                     rasterizer.to_raster()
-                    rasterizer.viz()
+                    sen_fetcher.establish_connection()
+                    sen_fetcher.form_query()
                 yield bbox_2180, osm_data, gdf 
                 count += 1
             else:
@@ -240,6 +288,6 @@ class GenerateSamples:
 
 generator = GenerateSamples(tile_size=2560, viz=True)
 for i, (bbox, osm, gdf) in enumerate(generator.samples(n=5)):
-    print(f"Sample {i} - BBOX: {bbox}, Rows: {len(gdf)}")
+    print(f"Sample {i}  BBOX: {bbox}, Rows: {len(gdf)}")
 
     
